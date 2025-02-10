@@ -108,7 +108,7 @@ IsoTp::MsgStateResult IsoTp::TransmitFirstFrame(ICanBusTx* bus, CANID txid, cons
     _txConsecutiveFrameIndex = 0;
 
     FrameData ff{};
-    ff.DLC = __CAN_MAX_FRAME_SIZE;  // first frame never padded
+    ff.size = __CAN_MAX_FRAME_SIZE;  // first frame never padded
     ff.data[0] = (BYTE)((FrameType::FIRST << 4) | (BYTE)((fulldatasize >> 8) & 0xFF));
     ff.data[1] = (BYTE)(fulldatasize & 0xFF);
 
@@ -126,13 +126,13 @@ IsoTp::MsgStateResult IsoTp::TransmitFirstFrame(ICanBusTx* bus, CANID txid, cons
 IsoTp::MsgStateResult IsoTp::TransmitSingleFrame(ICanBusTx* bus, CANID txid, const FrameData &data) const
 {
     const auto max = MaxSingleFrameSize(_defaultCanStandard);
-    if (data.DLC > max)
+    if (data.size > max)
     {
-        LogErrorInfo("'SendSingleFame' method supprots only DLC <= ", max, " (passed ", (int)data.DLC, " bytes).\n");
+        LogErrorInfo("'SendSingleFame' method supprots only DLC <= ", max, " (passed ", (int)data.size, " bytes).\n");
         return MsgStateResult::ERROR;
     }
     FrameData sf{};
-    const BYTE datasize = data.DLC;
+    const BYTE datasize = data.size;
     // In fact FrameType::Single << 4 is unnecessary, always 0, assuming compiler will optimize it out anyway
     sf.data[0] = (((BYTE)FrameType::SINGLE) << 4) | datasize;
     std::memcpy(&(sf.data[1]), data.data.data(), datasize);
@@ -140,11 +140,11 @@ IsoTp::MsgStateResult IsoTp::TransmitSingleFrame(ICanBusTx* bus, CANID txid, con
     if (IsPaddingEnabled())
     {
         std::fill(std::begin(sf.data) + 1, std::end(sf.data), static_cast<BYTE>(_paddingByte));
-        sf.DLC = __CAN_MAX_FRAME_SIZE;
+        sf.size = __CAN_MAX_FRAME_SIZE;
     }
     else
     {
-        sf.DLC = (1 + datasize);
+        sf.size = (1 + datasize);
     }
     if (bus->Transmit(txid, sf))
     {
@@ -162,7 +162,7 @@ IsoTp::MsgStateResult IsoTp::TransmitMessage(ICanBusTx* bus, CANID txid, const s
     if (type == FrameType::SINGLE)
     {
         FrameData txFrame{};
-        txFrame.DLC = static_cast<uint8_t>(datasize);
+        txFrame.size = static_cast<uint8_t>(datasize);
         std::memcpy(txFrame.data.data(), msgdata.data(), datasize);
         return TransmitSingleFrame(bus, txid, txFrame);
     }
@@ -179,7 +179,7 @@ IsoTp::MsgStateResult IsoTp::TransmitMessage(ICanBusTx* bus, CANID txid, const s
 
 IsoTp::MsgStateResult IsoTp::ProcessIsotpResponse(ICanBusTx* bus, CANID txid, CANID rxid, const FrameData &rxFrame)
 {
-    if (rxFrame.DLC <= 1)  // not a ISOTP frame - assume some status frame; continue
+    if (rxFrame.size <= 1)  // not a ISOTP frame - assume some status frame; continue
         return MsgStateResult::CONTINUE;
 
     auto ftype = GetRxFrameType(rxFrame);
@@ -280,7 +280,7 @@ IsoTp::MsgStateResult IsoTp::ProcessFirstFrameResponse(ICanBusTx* bus, CANID txi
     if (ExtractIsotpFirstOrSingleFrameSize(rxFrame, &outFullSize))
     {
         const size_t dataoffset = 2;
-        const size_t datasize = rxFrame.DLC - dataoffset;
+        const size_t datasize = rxFrame.size - dataoffset;
         const auto& rxData = rxFrame.data;
 
         _rxCompleteFrameExpectedSize = outFullSize;
@@ -317,7 +317,7 @@ IsoTp::MsgStateResult IsoTp::ProcessConsecutiveFrameResponse(ICanBusTx* bus, CAN
     if (ExtractIsotpConsecutiveFrameIndex(rxFrame, &outIndexCF))
     {
         const size_t dataoffset = 1;
-        const size_t datasize = rxFrame.DLC - dataoffset;
+        const size_t datasize = rxFrame.size - dataoffset;
 
         auto dest = &(_messageBufferRxTx.data()[_messageBufferSize]);
         std::memcpy(dest, &rxData[dataoffset], datasize);
@@ -455,7 +455,7 @@ bool IsoTp::ExtractIsotpFirstOrSingleFrameSize(const FrameData& frame, uint32_t*
         LogErrorInfo("Receive failed: CAN FD not supported!\n");
         return false;
     }
-    if (frame.DLC < 2)
+    if (frame.size < 2)
     {
         LogErrorInfo("Receive failed: unexpected frame lenght!\n");
         return false;
@@ -492,11 +492,11 @@ FrameData IsoTp::NewFlowControlFrame(const FlowControlData<BYTE> &fcData) const
     {
         const auto pad = static_cast<BYTE>(_paddingByte);
         std::fill(std::begin(cf.data) + cfsize, std::end(cf.data), pad);
-        cf.DLC = std::size(cf.data);
+        cf.size = std::size(cf.data);
     }
     else
     {
-        cf.DLC = cfsize;
+        cf.size = cfsize;
     }
     return cf;
 }
@@ -531,7 +531,7 @@ bool IsoTp::MakeNextConsecutiveFrame(FrameData *frame) noexcept
     int i = __CANISOTP_FF_DATA_SIZE + (_txConsecutiveFrameIndex * __CANISOTP_CF_MAX_DATA_SIZE);
     if (i > _messageBufferSize)
     {
-        frame->DLC = 0;
+        frame->size = 0;
         LogErrorInfo("Calulated CF frame byte index ", i, " > ", _messageBufferSize, " (msg buffer size)\n");
         return false;
     }
@@ -545,11 +545,11 @@ bool IsoTp::MakeNextConsecutiveFrame(FrameData *frame) noexcept
     if (IsPaddingEnabled() && datasize < __CANISOTP_CF_MAX_DATA_SIZE)
     {
         std::fill(std::begin(frame->data) + frameSize, std::end(frame->data), static_cast<BYTE>(_paddingByte));
-        frame->DLC = __CAN_MAX_FRAME_SIZE;
+        frame->size = __CAN_MAX_FRAME_SIZE;
     }
     else
     {
-        frame->DLC = static_cast<BYTE>(frameSize);
+        frame->size = static_cast<BYTE>(frameSize);
     }
     return true;
 }
@@ -605,7 +605,7 @@ void IsoTp::LogErrorInfo(const char* const rmsg, Args... args) const
 #pragma region Padding statics
 static size_t GetSizeWithoutPaddingByte(CAN::FrameData frame, int padding)
 {
-    return GetSizeWithoutPaddingByte(frame.data.data(), (size_t)frame.DLC, padding);
+    return GetSizeWithoutPaddingByte(frame.data.data(), (size_t)frame.size, padding);
 }
 static size_t GetSizeWithoutPaddingByte(const std::vector<BYTE> &data, int padding)
 {

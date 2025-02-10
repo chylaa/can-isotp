@@ -48,7 +48,7 @@ enum Standard : BYTE
 
 struct FrameData 
 {
-    std::uint8_t DLC;
+    std::uint8_t size;
     std::array<BYTE, __CAN_MAX_FRAME_SIZE> data;
 };
 
