@@ -55,7 +55,7 @@ struct FrameData
 class ICanBusTx 
 {
  public:
-    virtual bool Transmit(CANID txid, const FrameData& data) = 0;
+    virtual bool Transmit(CAN::CANID txid, const CAN::FrameData& data, CAN::Standard standard) = 0;
  protected:
     virtual ~ICanBusTx() = default;
 };

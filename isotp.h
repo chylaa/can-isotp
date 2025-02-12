@@ -50,7 +50,7 @@ class IsoTp
     int _paddingByte = -1;                          // no padding by default
 
  public:
-    enum class MsgStateResult { CONTINUE, FINALIZE_RX, FINALIZE_TX, FLOW_ABORT, ERROR, };
+    enum class MsgStateResult { ISOTP_CONTINUE, ISOTP_FINALIZE_RX, ISOTP_FINALIZE_TX, ISOTP_FLOW_ABORT, ISOTP_ERROR, };
 
     std::function<void(const char *)> m_funcLogError = nullptr;  // no err logging by default
 
@@ -106,15 +106,15 @@ class IsoTp
     FrameType GetTxFrameType(size_t size, Standard standard = Standard::Default) const noexcept;
 
     // Transmits a ISO-TP "Single-Frame", wihout changing the internal state
-    MsgStateResult TransmitSingleFrame(ICanBusTx* bus, CANID txid, const FrameData &data) const;
+    MsgStateResult TransmitSingleFrame(ICanBusTx* bus, CANID txid, const FrameData &payload, Standard standard) const;
     
-    // Transmits the "First-Frame" of an ISO-TP multi-frame message. Remaining bytes will be automatically sent
-    // after next received "Flow-Control" is passed to "IsoTp::ProcessIsotpResponse".
+    // Transmits the "First-Frame" of an ISO-TP multi-frame message using default CAN::Standard. 
+    // Remaining bytes will be automatically sent after next received "Flow-Control" is passed to "IsoTp::ProcessIsotpResponse".
     MsgStateResult TransmitFirstFrame(ICanBusTx* bus, CANID txid, const std::vector<BYTE> &fulldata);
 
     // Transmits data using appropriate method, selected base on vector size and default CAN::Standard
     //  (see "IsoTp::TransmitSingleFrame" and "IsoTp::TransmitFirstFrame").
-    MsgStateResult TransmitMessage(ICanBusTx* bus, CANID txid, const std::vector<BYTE> &data);
+    MsgStateResult TransmitMessage(ICanBusTx* bus, CANID txid, const std::vector<BYTE> &payload);
 
     // Processes an incoming ISO-TP response. Should be called on each received frame.
     MsgStateResult ProcessIsotpResponse(ICanBusTx* bus, CANID txid, CANID rxid, const FrameData &rxFrame);

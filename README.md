@@ -17,9 +17,9 @@ class MyCanBus : public CAN::ICanBusTx
 {
     // ...
     // Neccessary declaration for CAN::IsoTp
-    bool Transmit(CAN::CANID txid, const CAN::FrameData& txdata) override
+    bool Transmit(CAN::CANID txid, const CAN::FrameData& txdata, CAN::Standard standard) override
     {
-        // CAN TX logic
+        // CAN TX logic. Should handle potential (txdata.size == 0) case.
         return true;  // on tx success 
     }
     // "RX" function can be whatever as long as its results 
@@ -55,7 +55,7 @@ isotp->m_funcLogError = [](const char* err) { std::clog << err; };
 Process received frames in receive loop or something like "CAN data received" callback e.g.
 ```cpp
 // ...
-// std::array<CAN::byte, __CANISOTP_MAX_MSG_DATA_SIZE> m_responseBuffer;
+// std::array<CAN::BYTE, __CANISOTP_MAX_MSG_DATA_SIZE> m_responseBuffer;
 std::vector<CAN::BYTE> m_responseBuffer; 
 std::unique_ptr<MyCanBus> bus;
 std::unique_ptr<CAN::IsoTp> m_isotp;
@@ -69,16 +69,16 @@ void BusEvents::rx_callback(const MyFrame& canframe)
     auto result = m_isotp->ProcessIsotpResponse(bus, txid, rxid, data);
     switch (result)
     {
-    case CAN::IsoTp::MsgStateResult::CONTINUE:
+    case CAN::IsoTp::MsgStateResult::ISOTP_CONTINUE:
         break;
 
-    case CAN::IsoTp::MsgStateResult::FINALIZE_TX:
+    case CAN::IsoTp::MsgStateResult::ISOTP_FINALIZE_TX:
         std::cout << "Info state - basically CONTINUE\n";
         std::cout << "Flow-Control was received from device, whole multi-frame message sent.\n";
         assert(false == isotp->IsTransmitActive()); // IsoTp class TX state automatically cleared
         break;
 
-    case CAN::IsoTp::MsgStateResult::FINALIZE_RX:
+    case CAN::IsoTp::MsgStateResult::ISOTP_FINALIZE_RX:
         // Copy collected payload bytes to provied buffer
         bool size_ok = isotp->FinalizeIsotpResponse(&m_responseBuffer);
         assert(size_ok, "buffer size != expected payload size from last First-Frame");
@@ -86,11 +86,11 @@ void BusEvents::rx_callback(const MyFrame& canframe)
         std::cout << "Received " << responseBuffer.size() << " bytes.\n";
         break;
 
-    case CAN::IsoTp::MsgStateResult::FLOW_ABORT:
+    case CAN::IsoTp::MsgStateResult::ISOTP_FLOW_ABORT:
         assert(false == isotp->IsReceiveActive()); // IsoTp class RX state automatically cleared
         break;
 
-    case CAN::IsoTp::MsgStateResult::ERROR:
+    case CAN::IsoTp::MsgStateResult::ISOTP_ERROR:
         std::cout << "ISOTP error! Check err messages.\n";
         break;
 
@@ -107,12 +107,14 @@ Transmit messages using one of the following:
 ```cpp
 // Transmit payload as Single-Frame
 CAN::FrameData smalldata;
-auto result = TransmitSingleFrame(bus, txid, smalldata);
+CAN::Standard standard;
+auto result = TransmitSingleFrame(bus, txid, smalldata, standard);
 ```
 ```cpp
 // Copies payload to internal TX buffer and sends First-Frame
 // Remaining bytes will be automatically sent as Consecutive-Frames
-// - after next received "Flow Control" is passed to IsoTp::ProcessIsotpResponse
+// - after next received "Flow Control" is passed to IsoTp::ProcessIsotpResponse.
+// If neccessary, CAN::Standard must be set via 'isotp->setDefaulStandard(...)'
 std::vector<CAN::BYTE> largedata;
 auto result = isotp->TransmitFirstFrame(bus, txid, largedata);
 ```
@@ -129,7 +131,7 @@ auto result = isotp->TransmitMessage(bus, txid, data);
 GNU compilers for Win32 platform needs [pthreads](https://en.wikipedia.org/wiki/Pthreads) support (see `std::this_thread::slepp_for` in `isotp.cpp`).
 Use appropriate version (out of the box since `GCC 13`?) or check out [mingw-std-threads](https://github.com/meganz/mingw-std-threads). 
 
-When using modern Visual Studio C/C++ packet, build-in `MSVC` should provide it by default.  
+When using modern Visual Studio C/C++ Windows packet, build-in `MSVC` should provide it by default.  
 
 ---
 
