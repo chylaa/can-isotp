@@ -3,7 +3,7 @@
 Implementation of CAN ISO-TP state machine for transmitting/receiving data using **Single** and **First**/**Consecutive** frames with optional padding support.
 
 - User must provide a way to communicate at the frame level with CAN hardware.
-- The library supports only standard CAN frames with 8-byte payload (both 11/29-bit IDs) and ISO-TP 4095-byte payload (not compatible with CAN FD and CAN XL).
+- The library supports only standard CAN frames with 8-byte payload (both 11/29-bit IDs) and ISO-TP 4095-byte payload (not compatible with CAN FD).
 - By default on receiving First-Frame, IsoTp state machine always requests all remaining frames wihout delay (**`Flow Control`: `Block size = 0`, `ST = 0`**).
 - Suited mostly for applications under some OS environment.
 
