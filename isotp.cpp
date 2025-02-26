@@ -6,23 +6,51 @@
 #include "isotp.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cstring>
 #include <sstream>
 #include <thread>
 
 #include "./isotpdef.h"
 
-using CAN::IsoTp;
-using CAN::Standard;
-using CAN::FrameData;
+ // Value to pass as second byte of IsoTp FlowControl frame to signalize to transmitter,
+ // that remaining ConsecutiveFrames should be sent without flow control or delay.
+#define __CANISOTP_FC_REQ_ALL_REMAINING ((CAN::BYTE)0)
+
+#define __CANISOTP_FC_FRAME_SIZE  ((size_t)3)
+#define __CANISOTP_ID11_SF_MAX_DATA_SIZE  ((size_t)7)
+#define __CANISOTP_ID29_SF_MAX_DATA_SIZE  ((size_t)6)
+#define __CANISOTP_FF_DATA_SIZE  ((size_t)6)
+#define __CANISOTP_CF_MAX_DATA_SIZE  ((size_t)7)
+#define __CANISOTP_MAX_CF_INDEX  ((uint8_t)15)
+
 using CAN::BYTE;
+using CAN::FrameData;
+using CAN::IsoTp;
+using CAN::IsoTpState;
+using CAN::Standard;
 using std::chrono::microseconds;
 
-#pragma region Padding static prototypes
-static size_t GetSizeWithoutPaddingByte(CAN::FrameData frame, int padding);
-static size_t GetSizeWithoutPaddingByte(const std::vector<BYTE> &data, int padding);
-static size_t GetSizeWithoutPaddingByte(const BYTE* begin, size_t datasize, int padding);
-#pragma endregion
+enum IsoTp::FrameType : uint8_t
+{
+    SINGLE = 0,
+    FIRST = 1,
+    CONSECUTIVE = 2,
+    FLOW = 3,
+};
+enum IsoTp::FlowControl : uint8_t
+{
+    CONTINUE = 0,
+    WAIT = 1,
+    ABORT = 2,
+};
+template <typename ST>
+struct IsoTp::FlowControlData
+{
+    FlowControl type;
+    uint8_t blockSize;
+    ST separationTime;
+};
 
 void IsoTp::setDefaulStandard(Standard standard) noexcept
 {
@@ -49,11 +77,11 @@ inline bool IsoTp::IsPaddingEnabled() const noexcept
     return _paddingByte >= 0;
 }
 
-inline bool IsoTp::IsReceiveActive() const
+inline bool IsoTp::IsReceiveActive() const noexcept
 {
     return (_rxCompleteFrameExpectedSize != -1);
 }
-inline bool IsoTp::IsTransmitActive() const
+inline bool IsoTp::IsTransmitActive() const noexcept
 {
     return (_txConsecutiveFrameIndex != -1);
 }
@@ -70,124 +98,45 @@ void IsoTp::ClearIsotpTransmitState() noexcept
     _txConsecutiveFrameIndex = -1;
 }
 
-size_t IsoTp::MaxSingleFrameSize(Standard standard) const noexcept
+IsoTpState CAN::IsoTp::TransmitMessage(ICanBusTx* bus, CANID txid, const BYTE* payload, size_t size)
 {
-    if (standard == Standard::Default)
-        standard = _defaultCanStandard;  // promote to default standard
-    if (standard >= Standard::CEFF)
-        return __CANISOTP_ID29_SF_MAX_DATA_SIZE;  // CAN 2.0B (29bit id)
-    else
-        return __CANISOTP_ID11_SF_MAX_DATA_SIZE;  // assume CAN 2.0A (11bit id)
-}
-
-inline IsoTp::FrameType IsoTp::GetRxFrameType(const FrameData &msgRx) const noexcept
-{
-    return static_cast<FrameType>((msgRx.data[0] & 0b11110000) >> 4);
-}
-inline IsoTp::FrameType IsoTp::GetTxFrameType(size_t size, Standard standard) const noexcept
-{
-    return size > MaxSingleFrameSize(standard) ? FrameType::FIRST : FrameType::SINGLE;
-}
-
-IsoTp::MsgStateResult IsoTp::TransmitFirstFrame(ICanBusTx* bus, CANID txid, const std::vector<BYTE> &fulldata)
-{
-    auto fulldatasize = fulldata.size();
-    if (fulldatasize < __CANISOTP_FF_DATA_SIZE || __CANISOTP_MAX_MSG_DATA_SIZE < fulldatasize)
-    {
-        LogErrorInfo("Invalid data size for isotp First-Frame: ", fulldatasize, '\n');
-        return MsgStateResult::ISOTP_ERROR;
-    }
-    if (IsReceiveActive())
-    {
-        LogErrorInfo("Invalid state: isotp RX active; finalize receive!\n");
-        return MsgStateResult::ISOTP_ERROR;
-    }
-    ClearIsotpTransmitState();  // sanity call
-    std::memcpy(_messageBufferRxTx.data(), fulldata.data(), fulldatasize);
-    _messageBufferSize = fulldatasize;
-    _txConsecutiveFrameIndex = 0;
-
-    FrameData ff{};
-    ff.size = __CAN_MAX_FRAME_SIZE;  // first frame never padded
-    ff.data[0] = (BYTE)((FrameType::FIRST << 4) | (BYTE)((fulldatasize >> 8) & 0xFF));
-    ff.data[1] = (BYTE)(fulldatasize & 0xFF);
-
-    std::memcpy(&ff.data[2], _messageBufferRxTx.data(), __CANISOTP_FF_DATA_SIZE);
-
-    if (bus->Transmit(txid, ff, _defaultCanStandard))
-    {
-        return MsgStateResult::ISOTP_CONTINUE;
-    }
-    LogErrorInfo("ICanBusTx::Transmit failed to send FF to ", txid);
-    ClearIsotpTransmitState();
-    return MsgStateResult::ISOTP_ERROR;
-}
-
-IsoTp::MsgStateResult IsoTp::TransmitSingleFrame(ICanBusTx* bus, CANID txid, const FrameData &payload, Standard standard) const
-{
-    if (standard == Standard::Default) 
-    {
-        standard = _defaultCanStandard;
-    }
-    const auto max = MaxSingleFrameSize(standard);
-    if (payload.size > max)
-    {
-        LogErrorInfo("'SendSingleFame' method supprots only DLC <= ", max, " (passed ", (int)payload.size, " bytes).\n");
-        return MsgStateResult::ISOTP_ERROR;
-    }
-    FrameData sf{};
-    sf.size = payload.size;
-    if (sf.size) // we'll allow Transmit implementation to decide what to do with zero-length frames 
-    {
-        // In fact FrameType::Single << 4 is unnecessary, always 0, assuming compiler will optimize it out anyway
-        sf.data[0] = (((BYTE)FrameType::SINGLE) << 4) | sf.size;
-        std::memcpy(&(sf.data[1]), payload.data.data(), sf.size);
-        sf.size += 1;
-        if (IsPaddingEnabled())
-        {
-            auto beginIt = std::begin(sf.data) + sf.size;
-            std::fill(beginIt, std::end(sf.data), static_cast<BYTE>(_paddingByte));
-            sf.size = __CAN_MAX_FRAME_SIZE;
-        }
-    }
-    if (bus->Transmit(txid, sf, standard))
-    {
-        return MsgStateResult::ISOTP_FINALIZE_TX;
-    }
-    LogErrorInfo("ICanBusTx::Transmit failed to send SF to ", txid);
-    return MsgStateResult::ISOTP_ERROR;
-}
-
-IsoTp::MsgStateResult IsoTp::TransmitMessage(ICanBusTx* bus, CANID txid, const std::vector<BYTE> &payload)
-{
-    auto datasize = payload.size();
-    auto type = GetTxFrameType(datasize, _defaultCanStandard);
+    auto type = GetTxFrameType(size, _defaultCanStandard);
 
     if (type == FrameType::SINGLE)
     {
         FrameData txFrame{};
-        txFrame.size = static_cast<uint8_t>(datasize);
-        std::memcpy(txFrame.data.data(), payload.data(), datasize);
+        txFrame.size = static_cast<uint8_t>(size);
+        std::memcpy(txFrame.data.data(), payload, size);
         return TransmitSingleFrame(bus, txid, txFrame, _defaultCanStandard);
     }
     else if (type == FrameType::FIRST)
     {
-        return TransmitFirstFrame(bus, txid, payload);
+        return TransmitFirstFrame(bus, txid, payload, size);
     }
     else
     {
         LogErrorInfo("Cannot send: Unrecognized frame type ", (int)type, '\n');
-        return MsgStateResult::ISOTP_ERROR;
+        return IsoTpState::ISOTP_ERROR;
     }
 }
 
-IsoTp::MsgStateResult IsoTp::ProcessIsotpResponse(ICanBusTx* bus, CANID txid, CANID rxid, const FrameData &rxFrame)
+IsoTpState IsoTp::TransmitMessage(ICanBusTx* bus, CANID txid, const std::vector<BYTE>& payload)
+{
+    return TransmitMessage(bus, txid, payload.data(), payload.size());
+}
+
+IsoTpState CAN::IsoTp::TransmitMessage(ICanBusTx* bus, CANID txid, const FrameData& payload)
+{
+    return TransmitMessage(bus, txid, payload.data.data(), payload.size);
+}
+
+IsoTpState IsoTp::ProcessIsotpResponse(ICanBusTx* bus, CANID txid, CANID rxid, const FrameData& rxFrame)
 {
     if (rxFrame.size <= 1)  // not a ISOTP frame - assume some status frame; continue
-        return MsgStateResult::ISOTP_CONTINUE;
+        return IsoTpState::ISOTP_CONTINUE;
 
     auto ftype = GetRxFrameType(rxFrame);
-    MsgStateResult result = MsgStateResult::ISOTP_ERROR;
+    IsoTpState result = IsoTpState::ISOTP_ERROR;
 
     switch (ftype)
     {
@@ -214,48 +163,129 @@ IsoTp::MsgStateResult IsoTp::ProcessIsotpResponse(ICanBusTx* bus, CANID txid, CA
     return result;
 }
 
-bool IsoTp::FinalizeIsotpResponse(std::vector<BYTE>* buffer)
+void IsoTp::FinalizeIsotpResponse(std::vector<BYTE>* buffer)
 {
-    bool sizeOk = true;
-    if (buffer)
+    // not checking for any nulls, this kind of bug should fail fast
+    if (_rxCompleteFrameExpectedSize > 0)  // sanity check because expected size could be zeroed by user ("ClearIsotpReceiveState()")
     {
         buffer->clear();
-        size_t sizeNoPadding = GetSizeWithoutPaddingByte(_messageBufferRxTx.data(), _messageBufferSize, _paddingByte);
-        for (size_t i = 0; i < sizeNoPadding; ++i)
+        buffer->reserve(_rxCompleteFrameExpectedSize);
+        for (size_t i = 0; i < _rxCompleteFrameExpectedSize; ++i)
         {
-            buffer->push_back(_messageBufferRxTx[i]);
+            buffer->emplace_back(_messageBufferRxTx[i]);
         }
-        sizeOk = (_rxCompleteFrameExpectedSize == sizeNoPadding);
     }
     ClearIsotpReceiveState();
-    return sizeOk;
 }
 
-bool IsoTp::FinalizeIsotpResponse(std::array<BYTE, __CANISOTP_MAX_MSG_DATA_SIZE>* buffer, size_t* outSize)
+void IsoTp::FinalizeIsotpResponse(std::array<BYTE, __CANISOTP_MAX_MSG_DATA_SIZE>* buffer, size_t* outSize)
 {
-    bool sizeOk = true;
-    *outSize = 0;
-    if (buffer)
+    *outSize = 0; // not checking for any nulls, this kind of bug should fail fast
+    if (_rxCompleteFrameExpectedSize > 0)  // sanity check because expected size could be zeroed by user ("ClearIsotpReceiveState()")
     {
-        size_t sizeval = GetSizeWithoutPaddingByte(_messageBufferRxTx.data(), _messageBufferSize, _paddingByte);
-        *outSize = sizeval;
-        for (size_t i = 0; i < sizeval; ++i)
+        assert(_rxCompleteFrameExpectedSize <= _messageBufferSize);
+        *outSize = _rxCompleteFrameExpectedSize;
+        for (size_t i = 0; i < _rxCompleteFrameExpectedSize; ++i)
         {
             (*buffer)[i] = _messageBufferRxTx[i];
         }
-        sizeOk = (_rxCompleteFrameExpectedSize == sizeval);
     }
     ClearIsotpReceiveState();
-    return sizeOk;
 }
 
 #pragma region Privates
 
-
-IsoTp::MsgStateResult IsoTp::ProcessSingleFrameResponse(ICanBusTx* bus, CANID txid, CANID rxid, const FrameData& rxFrame)
+size_t IsoTp::MaxSingleFrameSize(Standard standard) const noexcept
 {
-    MsgStateResult result;
-    uint32_t outFullSize;
+    if (standard == Standard::Default)
+        standard = _defaultCanStandard;  // promote to default standard
+    if (standard >= Standard::CEFF)
+        return __CANISOTP_ID29_SF_MAX_DATA_SIZE;  // CAN 2.0B (29bit id)
+    else
+        return __CANISOTP_ID11_SF_MAX_DATA_SIZE;  // assume CAN 2.0A (11bit id)
+}
+
+inline IsoTp::FrameType IsoTp::GetRxFrameType(const FrameData& msgRx) const noexcept
+{
+    return static_cast<FrameType>((msgRx.data[0] & 0b11110000) >> 4);
+}
+inline IsoTp::FrameType IsoTp::GetTxFrameType(size_t size, Standard standard) const noexcept
+{
+    return size > MaxSingleFrameSize(standard) ? FrameType::FIRST : FrameType::SINGLE;
+}
+
+IsoTpState IsoTp::TransmitFirstFrame(ICanBusTx* bus, CANID txid, const BYTE* fulldata, size_t size)
+{
+    if (size < __CANISOTP_FF_DATA_SIZE || __CANISOTP_MAX_MSG_DATA_SIZE < size)
+    {
+        LogErrorInfo("Invalid data size for isotp First-Frame: ", size, '\n');
+        return IsoTpState::ISOTP_ERROR;
+    }
+    if (IsReceiveActive())
+    {
+        LogErrorInfo("Invalid state: isotp RX active; finalize receive!\n");
+        return IsoTpState::ISOTP_ERROR;
+    }
+    ClearIsotpTransmitState();  // sanity call
+    std::memcpy(_messageBufferRxTx.data(), fulldata, size);
+    _messageBufferSize = size;
+    _txConsecutiveFrameIndex = 0;
+
+    FrameData ff{};
+    ff.size = __CAN_MAX_FRAME_SIZE;  // first frame never padded
+    ff.data[0] = (BYTE)((BYTE)(FrameType::FIRST << 4) | ((size >> 8) & 0xFF));
+    ff.data[1] = (BYTE)(size & 0xFF);
+
+    std::memcpy(&ff.data[2], _messageBufferRxTx.data(), __CANISOTP_FF_DATA_SIZE);
+
+    if (bus->Transmit(txid, ff, _defaultCanStandard))
+    {
+        return IsoTpState::ISOTP_CONTINUE;
+    }
+    LogErrorInfo("ICanBusTx::Transmit failed to send FF to ", txid);
+    ClearIsotpTransmitState();
+    return IsoTpState::ISOTP_ERROR;
+}
+
+IsoTpState IsoTp::TransmitSingleFrame(ICanBusTx* bus, CANID txid, const FrameData &payload, Standard standard) const
+{
+    if (standard == Standard::Default)
+    {
+        standard = _defaultCanStandard;
+    }
+    const auto max = MaxSingleFrameSize(standard);
+    if (payload.size > max)
+    {
+        LogErrorInfo("'SendSingleFame' method supprots only DLC <= ", max, " (passed ", (int)payload.size, " bytes).\n");
+        return IsoTpState::ISOTP_ERROR;
+    }
+    FrameData sf{};
+    sf.size = payload.size;
+    if (sf.size) // we'll allow Transmit implementation to decide what to do with zero-length frames 
+    {
+        // In fact FrameType::Single << 4 is unnecessary, always 0, assuming compiler will optimize it out anyway
+        sf.data[0] = (((BYTE)FrameType::SINGLE) << 4) | sf.size;
+        std::memcpy(&(sf.data[1]), payload.data.data(), sf.size);
+        sf.size += 1;
+        if (IsPaddingEnabled())
+        {
+            auto beginIt = std::begin(sf.data) + sf.size;
+            std::fill(beginIt, std::end(sf.data), static_cast<BYTE>(_paddingByte));
+            sf.size = __CAN_MAX_FRAME_SIZE;
+        }
+    }
+    if (bus->Transmit(txid, sf, standard))
+    {
+        return IsoTpState::ISOTP_FINALIZE_TX;
+    }
+    LogErrorInfo("ICanBusTx::Transmit failed to send SF to ", txid);
+    return IsoTpState::ISOTP_ERROR;
+}
+
+IsoTpState IsoTp::ProcessSingleFrameResponse(ICanBusTx* bus, CANID txid, CANID rxid, const FrameData& rxFrame)
+{
+    IsoTpState result;
+    size_t outFullSize;
     
     ClearIsotpReceiveState(); // sanity call
     if (ExtractIsotpFirstOrSingleFrameSize(rxFrame, &outFullSize))
@@ -265,20 +295,20 @@ IsoTp::MsgStateResult IsoTp::ProcessSingleFrameResponse(ICanBusTx* bus, CANID tx
         _rxCompleteFrameExpectedSize = outFullSize;
         std::memcpy(_messageBufferRxTx.data(), &rxData[dataoffset], outFullSize);
         _messageBufferSize = outFullSize;
-        result = MsgStateResult::ISOTP_FINALIZE_RX;
+        result = IsoTpState::ISOTP_FINALIZE_RX;
     }
     else
     {
         LogErrorInfo("Failed to extract single frame data!\n");
-        result = MsgStateResult::ISOTP_ERROR;
+        result = IsoTpState::ISOTP_ERROR;
     }
     return result;
 }
 
-IsoTp::MsgStateResult IsoTp::ProcessFirstFrameResponse(ICanBusTx* bus, CANID txid, CANID rxid, const FrameData& rxFrame)
+IsoTpState IsoTp::ProcessFirstFrameResponse(ICanBusTx* bus, CANID txid, CANID rxid, const FrameData& rxFrame)
 {
-    MsgStateResult result;
-    uint32_t outFullSize;
+    IsoTpState result;
+    size_t outFullSize;
 
     ClearIsotpReceiveState();
     if (ExtractIsotpFirstOrSingleFrameSize(rxFrame, &outFullSize))
@@ -299,23 +329,23 @@ IsoTp::MsgStateResult IsoTp::ProcessFirstFrameResponse(ICanBusTx* bus, CANID txi
     {
         TransmitFlowControl(bus, txid, { FlowControl::ABORT, 0, 0 });
         LogErrorInfo("Failed to extract first frame data!\n");
-        result = MsgStateResult::ISOTP_ERROR;
+        result = IsoTpState::ISOTP_ERROR;
     }
     return result;
 }
 
-IsoTp::MsgStateResult IsoTp::ProcessConsecutiveFrameResponse(ICanBusTx* bus, CANID txid, CANID rxid, const FrameData& rxFrame)
+IsoTpState IsoTp::ProcessConsecutiveFrameResponse(ICanBusTx* bus, CANID txid, CANID rxid, const FrameData& rxFrame)
 {
     if (_rxConsecutiveFrameIndex < 0 || _rxCompleteFrameExpectedSize < 0)
     {
         LogErrorInfo("Invalid State: no First-Frame before this Consecutive-Frame!\n");
-        return MsgStateResult::ISOTP_ERROR;
+        return IsoTpState::ISOTP_ERROR;
     }
 
     ++_rxConsecutiveFrameIndex;  // expected CF index
     _rxConsecutiveFrameIndex %= (__CANISOTP_MAX_CF_INDEX + 1);
 
-    MsgStateResult result;
+    IsoTpState result;
     int outIndexCF = -1;
     const auto& rxData = rxFrame.data;
 
@@ -328,44 +358,55 @@ IsoTp::MsgStateResult IsoTp::ProcessConsecutiveFrameResponse(ICanBusTx* bus, CAN
         std::memcpy(dest, &rxData[dataoffset], datasize);
         _messageBufferSize += datasize;
 
-        if ((outIndexCF != _rxConsecutiveFrameIndex) || (_messageBufferSize >= _rxCompleteFrameExpectedSize))
-            result = MsgStateResult::ISOTP_FINALIZE_RX;
-        else
-            result = MsgStateResult::ISOTP_CONTINUE;
+        if (outIndexCF != _rxConsecutiveFrameIndex) 
+        {
+            LogErrorInfo("Unexpected Consecutive Frame index! Got ", outIndexCF, " expected ", _rxConsecutiveFrameIndex);
+            TransmitFlowControl(bus, txid, { FlowControl::ABORT, 0, 0 });
+            ClearIsotpReceiveState();
+            result = IsoTpState::ISOTP_ERROR;
+        }
+        else if ((_messageBufferSize >= _rxCompleteFrameExpectedSize)) 
+        {
+            result = IsoTpState::ISOTP_FINALIZE_RX;
+        }
+        else 
+        {
+            result = IsoTpState::ISOTP_CONTINUE;
+        }
     }
     else
     {
         LogErrorInfo("Failed to extract first frame data!\n");
-        result = MsgStateResult::ISOTP_ERROR;
+        result = IsoTpState::ISOTP_ERROR;
     }
     return result;
 }
 
-IsoTp::MsgStateResult IsoTp::ProcessFlowControlResponse(ICanBusTx* bus, CANID txid, CANID rxid, const FrameData& rxFrame)
+IsoTpState IsoTp::ProcessFlowControlResponse(ICanBusTx* bus, CANID txid, CANID rxid, const FrameData& rxFrame)
 {
     FlowControlData<microseconds> fcData;
-    MsgStateResult result = MsgStateResult::ISOTP_ERROR;
+    IsoTpState result = IsoTpState::ISOTP_ERROR;
     if (ExtractFlowControlFrameData(rxFrame, &fcData))
     {
         if (false == IsTransmitActive())
         {
             LogErrorInfo("Unexpected flow control frame: ISOTP transmit uninitialized!\n");
-            return MsgStateResult::ISOTP_ERROR;
+            return IsoTpState::ISOTP_ERROR;
         }
         if (fcData.type == FlowControl::WAIT)
         {
-            return MsgStateResult::ISOTP_CONTINUE;;
+            return IsoTpState::ISOTP_CONTINUE;;
         }
         if (fcData.type == FlowControl::ABORT)
         {
             ClearIsotpReceiveState();
-            return MsgStateResult::ISOTP_FLOW_ABORT;
+            return IsoTpState::ISOTP_FLOW_ABORT;
         }
         int numOfRemainingTxCF = GetNumOfRemainingTxConsecutiveFrames();
         if (numOfRemainingTxCF < 0)
         {
             LogErrorInfo("Unexpected isotp state: ", numOfRemainingTxCF, " frames to send!\n");
-            return MsgStateResult::ISOTP_ERROR;
+            return IsoTpState::ISOTP_ERROR;
         }
 
         int iblockSize = static_cast<int>(fcData.blockSize);
@@ -382,7 +423,7 @@ IsoTp::MsgStateResult IsoTp::ProcessFlowControlResponse(ICanBusTx* bus, CANID tx
                 if (false == bus->Transmit(txid, nextCF, _defaultCanStandard))
                 {
                     LogErrorInfo("ICanTxBus::Transmit failed on CF no. ", i);
-                    result = MsgStateResult::ISOTP_ERROR;
+                    result = IsoTpState::ISOTP_ERROR;
                     break;
                 }
                 // if requested introduce SOME delay
@@ -391,13 +432,13 @@ IsoTp::MsgStateResult IsoTp::ProcessFlowControlResponse(ICanBusTx* bus, CANID tx
                     // ST indicates a minimum delay anyways (we'll take longer)
                     std::this_thread::sleep_for(fcData.separationTime);
                 }
-                result = MsgStateResult::ISOTP_CONTINUE;
+                result = IsoTpState::ISOTP_CONTINUE;
             }
             else
             {
                 TransmitFlowControl(bus, txid, { FlowControl::ABORT, 0, 0 });
                 LogErrorInfo("Failed to create next consecutive frame!\n");
-                result = MsgStateResult::ISOTP_ERROR;
+                result = IsoTpState::ISOTP_ERROR;
                 break;
             }
         }
@@ -405,9 +446,9 @@ IsoTp::MsgStateResult IsoTp::ProcessFlowControlResponse(ICanBusTx* bus, CANID tx
         if (GetNumOfRemainingTxConsecutiveFrames() == 0)
         {
             ClearIsotpTransmitState();
-            result = MsgStateResult::ISOTP_FINALIZE_TX;
+            result = IsoTpState::ISOTP_FINALIZE_TX;
         }
-        else if (result == MsgStateResult::ISOTP_ERROR)
+        else if (result == IsoTpState::ISOTP_ERROR)
         {
             ClearIsotpTransmitState();
         }
@@ -415,7 +456,7 @@ IsoTp::MsgStateResult IsoTp::ProcessFlowControlResponse(ICanBusTx* bus, CANID tx
     else
     {
         LogErrorInfo("Failed to extract flow control frame data!\n");
-        result = MsgStateResult::ISOTP_ERROR;
+        result = IsoTpState::ISOTP_ERROR;
     }
     return result;
 }
@@ -423,10 +464,9 @@ IsoTp::MsgStateResult IsoTp::ProcessFlowControlResponse(ICanBusTx* bus, CANID tx
 
 bool IsoTp::ExtractFlowControlFrameData(const FrameData& frame, FlowControlData<microseconds>* outFCData) const
 {
-    size_t size = GetSizeWithoutPaddingByte(frame, _paddingByte);
-    if (size != __CANISOTP_FC_FRAME_SIZE)
+    if (frame.size < __CANISOTP_FC_FRAME_SIZE)
     {
-        LogErrorInfo("Not Flow Control frame! DLC = ", size, '\n');
+        LogErrorInfo("Not Flow Control frame! DLC = ", frame.size, '\n');
         return false;
     }
     outFCData->type = static_cast<FlowControl>(frame.data[0] & 0b1111);
@@ -452,7 +492,7 @@ bool IsoTp::ExtractIsotpConsecutiveFrameIndex(const FrameData& frame, int* outIn
     *outIndex = -1;
     return false;
 }
-bool IsoTp::ExtractIsotpFirstOrSingleFrameSize(const FrameData& frame, uint32_t* outFullSize) const
+bool IsoTp::ExtractIsotpFirstOrSingleFrameSize(const FrameData& frame, size_t* outFullSize) const
 {
     auto& fdata = frame.data;
     if ((fdata[0] == 0) || (fdata[0] == 0x10 && fdata[1] == 0x00)) // is SF_FD or FF_FD?
@@ -468,7 +508,7 @@ bool IsoTp::ExtractIsotpFirstOrSingleFrameSize(const FrameData& frame, uint32_t*
     const auto ftype = GetRxFrameType(frame);
     if (ftype == FrameType::SINGLE)
     {
-        *outFullSize = static_cast<uint16_t>(frame.data[0] & 0b1111);
+        *outFullSize = static_cast<size_t>(frame.data[0] & 0b1111);
         return true;
     }
     if (ftype != FrameType::FIRST)
@@ -476,7 +516,7 @@ bool IsoTp::ExtractIsotpFirstOrSingleFrameSize(const FrameData& frame, uint32_t*
         LogErrorInfo("Received message is not expected ISOTP First-Frame!\n");
         return false;
     }
-    *outFullSize = static_cast<uint16_t>(((fdata[0] & 0b1111) << 8) | fdata[1]);
+    *outFullSize = static_cast<size_t>(((fdata[0] & 0b1111) << 8) | fdata[1]);
     if (*outFullSize < 8)
     {
         LogErrorInfo("First-Frame error: declared full size less than minimum 8 bytes!\n");
@@ -485,12 +525,12 @@ bool IsoTp::ExtractIsotpFirstOrSingleFrameSize(const FrameData& frame, uint32_t*
     return true;
 }
 
-FrameData IsoTp::NewFlowControlFrame(const FlowControlData<BYTE> &fcData) const
+FrameData IsoTp::NewFlowControlFrame(const FlowControlData<BYTE>& fcData) const
 {
     FrameData cf{};
     const size_t cfsize = __CANISOTP_FC_FRAME_SIZE;
-    cf.data[0] = static_cast<BYTE>(0x30 | fcData.type);
-    cf.data[1] = static_cast<BYTE>(fcData.blockSize);
+    cf.data[0] = (BYTE)(0x30 | fcData.type);
+    cf.data[1] = (BYTE)(fcData.blockSize);
     cf.data[2] = fcData.separationTime;
 
     if (IsPaddingEnabled())
@@ -513,22 +553,22 @@ int IsoTp::GetNumOfRemainingTxConsecutiveFrames() const noexcept
     if (remainingBytes <= 0)
         return 0;
 
-    int numOfConsevutiveFrames = static_cast<int>(remainingBytes / __CANISOTP_CF_MAX_DATA_SIZE);
+    int numOfConsevutiveFrames = (remainingBytes / __CANISOTP_CF_MAX_DATA_SIZE);
     numOfConsevutiveFrames += ((remainingBytes % __CANISOTP_CF_MAX_DATA_SIZE == 0) ? 0 : 1);
     return numOfConsevutiveFrames;
 }
 
-IsoTp::MsgStateResult IsoTp::TransmitFlowControl(ICanBusTx* bus, CANID txid, const FlowControlData<BYTE> &fc) const
+IsoTpState IsoTp::TransmitFlowControl(ICanBusTx* bus, CANID txid, const FlowControlData<BYTE>& fc) const
 {
 #ifdef _DEBUG
     if (fc.blockSize == __CANISOTP_FC_REQ_ALL_REMAINING && (fc.separationTime > 0x7F))
         throw std::exception("If blockSize == 0, ST must be in range of: 0 <= ST <= 127\n");
 #endif
     if (bus->Transmit(txid, NewFlowControlFrame(fc), _defaultCanStandard))
-        return MsgStateResult::ISOTP_CONTINUE;
+        return IsoTpState::ISOTP_CONTINUE;
 
     LogErrorInfo("ICanBusTx::Transmit failed while transmitting FC frame ", fc.type, " to ", txid);
-    return MsgStateResult::ISOTP_ERROR;
+    return IsoTpState::ISOTP_ERROR;
 }
 
 bool IsoTp::MakeNextConsecutiveFrame(FrameData *frame) noexcept
@@ -543,7 +583,7 @@ bool IsoTp::MakeNextConsecutiveFrame(FrameData *frame) noexcept
     const int index = ++_txConsecutiveFrameIndex;
     const auto datasize = std::min(_messageBufferSize - i, __CANISOTP_CF_MAX_DATA_SIZE);
 
-    frame->data[0] = ((BYTE)(((BYTE)FrameType::CONSECUTIVE << 4) | (index % (__CANISOTP_MAX_CF_INDEX + 1))));
+    frame->data[0] = (BYTE)((FrameType::CONSECUTIVE << 4) | (index % (__CANISOTP_MAX_CF_INDEX + 1)));
     std::memcpy(&(frame->data[1]), &_messageBufferRxTx[i], datasize);
 
     const auto frameSize = (1 + datasize);
@@ -603,32 +643,5 @@ void IsoTp::LogErrorInfo(const char* const rmsg, Args... args) const
     }
 }
 
-
 #endif
 #pragma endregion
-
-#pragma region Padding statics
-static size_t GetSizeWithoutPaddingByte(CAN::FrameData frame, int padding)
-{
-    return GetSizeWithoutPaddingByte(frame.data.data(), (size_t)frame.size, padding);
-}
-static size_t GetSizeWithoutPaddingByte(const std::vector<BYTE> &data, int padding)
-{
-    return GetSizeWithoutPaddingByte(data.data(), data.size(), padding);
-}
-static size_t GetSizeWithoutPaddingByte(const BYTE *begin, size_t datasize, int padding)
-{
-    if (padding < 0)
-        return datasize;
-
-    const auto padbyte = static_cast<BYTE>(padding);
-    auto i = static_cast<int64_t>(datasize - 1);
-    while (i >= 0 && begin[i] == padbyte)
-    {
-        --datasize;
-        --i;
-    }
-    return datasize;
-}
-#pragma endregion
-

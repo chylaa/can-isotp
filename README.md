@@ -7,7 +7,11 @@ Implementation of CAN ISO-TP state machine for transmitting/receiving data using
 - By default on receiving First-Frame, IsoTp state machine always requests all remaining frames wihout delay (**`Flow Control`: `Block size = 0`, `ST = 0`**).
 - Suited mostly for applications under some OS environment.
 
---- 
+---
+
+## API version 1.0.x
+
+Note: using [SemVer](https://semver.org/) standard in commit tags.  
 
 ### Usage
 
@@ -69,28 +73,27 @@ void BusEvents::rx_callback(const MyFrame& canframe)
     auto result = m_isotp->ProcessIsotpResponse(bus, txid, rxid, data);
     switch (result)
     {
-    case CAN::IsoTp::MsgStateResult::ISOTP_CONTINUE:
+    case CAN::IsoTpState::ISOTP_CONTINUE:
         break;
 
-    case CAN::IsoTp::MsgStateResult::ISOTP_FINALIZE_TX:
+    case CAN::IsoTpState::ISOTP_FINALIZE_TX:
         std::cout << "Info state - basically CONTINUE\n";
         std::cout << "Flow-Control was received from device, whole multi-frame message sent.\n";
         assert(false == isotp->IsTransmitActive()); // IsoTp class TX state automatically cleared
         break;
 
-    case CAN::IsoTp::MsgStateResult::ISOTP_FINALIZE_RX:
+    case CAN::IsoTpState::ISOTP_FINALIZE_RX:
         // Copy collected payload bytes to provied buffer
-        bool size_ok = isotp->FinalizeIsotpResponse(&m_responseBuffer);
-        assert(size_ok, "buffer size != expected payload size from last First-Frame");
+        isotp->FinalizeIsotpResponse(&m_responseBuffer);
         assert(false == isotp->IsReceiveActive());  // IsoTp class RX state automatically cleared
         std::cout << "Received " << responseBuffer.size() << " bytes.\n";
         break;
 
-    case CAN::IsoTp::MsgStateResult::ISOTP_FLOW_ABORT:
+    case CAN::IsoTpState::ISOTP_FLOW_ABORT:
         assert(false == isotp->IsReceiveActive()); // IsoTp class RX state automatically cleared
         break;
 
-    case CAN::IsoTp::MsgStateResult::ISOTP_ERROR:
+    case CAN::IsoTpState::ISOTP_ERROR:
         std::cout << "ISOTP error! Check err messages.\n";
         break;
 
@@ -105,23 +108,15 @@ void BusEvents::rx_callback(const MyFrame& canframe)
 
 Transmit messages using one of the following:
 ```cpp
-// Transmit payload as Single-Frame
-CAN::FrameData smalldata;
-CAN::Standard standard;
-auto result = TransmitSingleFrame(bus, txid, smalldata, standard);
-```
-```cpp
-// Copies payload to internal TX buffer and sends First-Frame
-// Remaining bytes will be automatically sent as Consecutive-Frames
-// - after next received "Flow Control" is passed to IsoTp::ProcessIsotpResponse.
-// If neccessary, CAN::Standard must be set via 'isotp->setDefaulStandard(...)'
-std::vector<CAN::BYTE> largedata;
-auto result = isotp->TransmitFirstFrame(bus, txid, largedata);
-```
-```cpp
-// Deduce SF/FF from data size and call appropriate method
-std::vector<CAN::BYTE> data;
-auto result = isotp->TransmitMessage(bus, txid, data);
+// Copies payload to internal TX buffer and sends "Single/First-Frame" depending on data size.
+// Any remaining bytes will be automatically sent as "Consecutive-Frames" 
+// - after next received "Flow Control" is passed to 'IsoTp::ProcessIsotpResponse(...)'.
+// If neccessary, CAN::Standard must be set via 'IsoTp::setDefaulStandard(...)'.
+// Returns one of the following: IsoTpState::ISOTP_FINALIZE_TX/ISOTP_CONTINUE/ISOTP_ERROR.
+
+IsoTpState TransmitMessage(ICanBusTx* bus, CANID txid, const BYTE* payload, size_t size);
+IsoTpState TransmitMessage(ICanBusTx* bus, CANID txid, const std::vector<BYTE>& payload);
+IsoTpState TransmitMessage(ICanBusTx* bus, CANID txid, const FrameData& payload);
 ```
 
 ---
